@@ -5,9 +5,9 @@ import functools
 import inspect
 import json
 import time
-from collections.abc import AsyncGenerator, AsyncIterable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, Union, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from opentelemetry import trace
 from pydantic import ValidationError
@@ -20,8 +20,10 @@ from ..llm import (
     ChatContext,
     StopResponse,
     ToolContext,
+    ToolError,
     utils as llm_utils,
 )
+from ..llm.chat_context import Instructions
 from ..log import logger
 from ..telemetry import trace_types, tracer
 from ..types import USERDATA_TIMED_TRANSCRIPT, FlushSentinel, NotGivenOr
@@ -29,12 +31,12 @@ from ..utils import aio, is_given
 from ..utils.aio import itertools
 from . import io
 from .speech_handle import SpeechHandle
-from .transcription.filters import apply_text_transforms
+from .transcription.text_transforms import _apply_text_transforms
 
 if TYPE_CHECKING:
     from .agent import Agent, ModelSettings
     from .agent_session import AgentSession
-    from .transcription.filters import TextTransforms
+    from .transcription.text_transforms import TextTransforms
 
 
 @runtime_checkable
@@ -60,7 +62,7 @@ def perform_llm_inference(
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
-    text_ch = aio.Chan[Union[str, FlushSentinel]]()
+    text_ch = aio.Chan[str | FlushSentinel]()
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
@@ -120,6 +122,7 @@ async def _llm_inference_task(
     # are using the newer tools.
     # tool_ctx here is ephemeral for this turn, and we allow manipulations
     tool_ctx.update_tools(tools)
+    tools_snapshot = tools.copy()
 
     if isinstance(llm_node, str):
         data.generated_text = llm_node
@@ -149,6 +152,14 @@ async def _llm_inference_task(
                     for tool in chunk.delta.tool_calls:
                         if tool.type != "function":
                             continue
+
+                        # lazily update the tool_ctx in case tools changed in the middle of `llm_node`
+                        if (
+                            tool_ctx.get_function_tool(tool.name) is None
+                            and tools != tools_snapshot
+                        ):
+                            tool_ctx.update_tools(tools)
+                            tools_snapshot = tools.copy()
 
                         fnc_call = llm.FunctionCall(
                             id=f"{data.id}/fnc_{len(data.generated_functions)}",
@@ -199,7 +210,7 @@ def perform_tts_inference(
     text_transforms: Sequence[TextTransforms] | None,
 ) -> tuple[asyncio.Task[bool], _TTSGenerationData]:
     audio_ch = aio.Chan[rtc.AudioFrame]()
-    timed_texts_fut = asyncio.Future[Optional[aio.Chan[io.TimedString]]]()
+    timed_texts_fut = asyncio.Future[aio.Chan[io.TimedString] | None]()
     data = _TTSGenerationData(audio_ch=audio_ch, timed_texts_fut=timed_texts_fut)
 
     tts_task = asyncio.create_task(
@@ -231,7 +242,7 @@ async def _tts_inference_task(
     @tracer.start_as_current_span("tts_node")
     async def _tts_node_inference(input: AsyncIterable[str], pushed_duration: float) -> float:
         if text_transforms:
-            input = apply_text_transforms(input, text_transforms)
+            input = _apply_text_transforms(input, text_transforms)
 
         tts_node = node(input, model_settings)
         if asyncio.iscoroutine(tts_node):
@@ -343,6 +354,10 @@ class _AudioOutput:
     first_frame_fut: asyncio.Future[float]
     """Future that will be set with the timestamp of the first frame's capture"""
 
+    def _resolve_first_frame_fut(self, ev: io.PlaybackStartedEvent) -> None:
+        if not self.first_frame_fut.done():
+            self.first_frame_fut.set_result(ev.created_at)
+
 
 def perform_audio_forwarding(
     *,
@@ -350,6 +365,11 @@ def perform_audio_forwarding(
     tts_output: AsyncIterable[rtc.AudioFrame],
 ) -> tuple[asyncio.Task[None], _AudioOutput]:
     out = _AudioOutput(audio=[], first_frame_fut=asyncio.Future())
+    # out.first_frame_fut should be cancelled in the caller after the playout is finished or interrupted
+    audio_output.on("playback_started", out._resolve_first_frame_fut)
+    out.first_frame_fut.add_done_callback(
+        lambda _: audio_output.off("playback_started", out._resolve_first_frame_fut)
+    )
     task = asyncio.create_task(_audio_forwarding_task(audio_output, tts_output, out))
     return task, out
 
@@ -362,12 +382,7 @@ async def _audio_forwarding_task(
 ) -> None:
     resampler: rtc.AudioResampler | None = None
 
-    def _on_playback_started(ev: io.PlaybackStartedEvent) -> None:
-        if not out.first_frame_fut.done():
-            out.first_frame_fut.set_result(ev.created_at)
-
     try:
-        audio_output.on("playback_started", _on_playback_started)
         audio_output.resume()
 
         async for frame in tts_output:
@@ -396,11 +411,6 @@ async def _audio_forwarding_task(
                 await audio_output.capture_frame(frame)
 
     finally:
-        audio_output.off("playback_started", _on_playback_started)
-
-        if not out.first_frame_fut.done():
-            out.first_frame_fut.cancel()
-
         if isinstance(tts_output, _ACloseable):
             try:
                 await tts_output.aclose()
@@ -487,15 +497,29 @@ async def _execute_tools_task(
                         "speech_id": speech_handle.id,
                     },
                 )
+                _tool_completed(
+                    make_tool_output(
+                        fnc_call=fnc_call,
+                        output=None,
+                        exception=ToolError(f"Unknown function: {fnc_call.name}"),
+                    )
+                )
                 continue
 
-            if not isinstance(function_tool, (llm.FunctionTool, llm.RawFunctionTool)):
+            if not isinstance(function_tool, llm.FunctionTool | llm.RawFunctionTool):
                 logger.error(
                     f"unknown tool type: {type(function_tool)}",
                     extra={
                         "function": fnc_call.name,
                         "speech_id": speech_handle.id,
                     },
+                )
+                _tool_completed(
+                    make_tool_output(
+                        fnc_call=fnc_call,
+                        output=None,
+                        exception=ToolError(f"Unknown tool type for function: {fnc_call.name}"),
+                    )
                 )
                 continue
 
@@ -574,7 +598,7 @@ async def _execute_tools_task(
                         bound = sig.bind_partial(*trimmed_args, **trimmed_kwargs)
                         bound.apply_defaults()
 
-                        if asyncio.iscoroutinefunction(mock):
+                        if inspect.iscoroutinefunction(mock):
                             return await mock(*bound.args, **bound.kwargs)
                         else:
                             return mock(*bound.args, **bound.kwargs)
@@ -608,7 +632,16 @@ async def _execute_tools_task(
                         val = await function_callable()
                         output = make_tool_output(fnc_call=fnc_call, output=val, exception=None)
                     except BaseException as e:
-                        if not isinstance(e, StopResponse):
+                        if isinstance(e, ToolError):
+                            logger.warning(
+                                "ToolError while executing tool: %s",
+                                e.message,
+                                extra={
+                                    "function": fnc_call.name,
+                                    "speech_id": speech_handle.id,
+                                },
+                            )
+                        elif not isinstance(e, StopResponse):
                             logger.exception(
                                 "exception occurred while executing tool",
                                 extra={"function": fnc_call.name, "speech_id": speech_handle.id},
@@ -762,7 +795,9 @@ The ID of the instructions message in the chat context. (only for stateless LLMs
 """
 
 
-def update_instructions(chat_ctx: ChatContext, *, instructions: str, add_if_missing: bool) -> None:
+def update_instructions(
+    chat_ctx: ChatContext, *, instructions: str | Instructions, add_if_missing: bool
+) -> None:
     """
     Update the instruction message in the chat context or insert a new one if missing.
 
@@ -792,6 +827,23 @@ def update_instructions(chat_ctx: ChatContext, *, instructions: str, add_if_miss
             0,
             llm.ChatMessage(id=INSTRUCTIONS_MESSAGE_ID, role="system", content=[instructions]),
         )
+
+
+def apply_instructions_modality(
+    chat_ctx: ChatContext, *, modality: Literal["audio", "text"]
+) -> None:
+    idx = chat_ctx.index_by_id(INSTRUCTIONS_MESSAGE_ID)
+    if idx is not None and (item := chat_ctx.items[idx]).type == "message":
+        has_modality_specific = any(isinstance(c, Instructions) for c in item.content)
+        if not has_modality_specific:
+            return
+
+        # ChatContext.copy shadows the original item, create a new instance to avoid mutating the original
+        new_item = item.model_copy()
+        new_item.content = [
+            c.as_modality(modality) if isinstance(c, Instructions) else c for c in new_item.content
+        ]
+        chat_ctx.items[idx] = new_item
 
 
 def remove_instructions(chat_ctx: ChatContext) -> None:

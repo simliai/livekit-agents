@@ -3,14 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import inspect
-import sys
 import types
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Annotated,
     Any,
-    Callable,
     Union,
     cast,
     get_args,
@@ -201,10 +200,6 @@ def build_legacy_openai_schema(
     info = function_tool.info
     schema = model.model_json_schema()
 
-    # Ensure 'required' field exists for compatibility with strict APIs like Groq
-    if "required" not in schema:
-        schema["required"] = []
-
     if internally_tagged:
         return {
             "name": info.name,
@@ -230,10 +225,6 @@ def build_strict_openai_schema(
     model = function_arguments_to_pydantic_model(function_tool)
     info = function_tool.info
     schema = _strict.to_strict_json_schema(model)
-
-    # Ensure 'required' field exists for compatibility with strict APIs
-    if "required" not in schema:
-        schema["required"] = []
 
     return {
         "type": "function",
@@ -381,6 +372,8 @@ def prepare_function_arguments(
     signature = inspect.signature(fnc)
     type_hints = get_type_hints(fnc, include_extras=True)
     args_dict = from_json(json_arguments)
+    if args_dict is None:
+        args_dict = {}
 
     if isinstance(fnc, FunctionTool):
         model_type = function_arguments_to_pydantic_model(fnc)
@@ -432,8 +425,7 @@ def _is_optional_type(hint: Any) -> bool:
     origin = get_origin(hint)
 
     is_union = origin is Union
-    if sys.version_info >= (3, 10):
-        is_union = is_union or origin is types.UnionType
+    is_union = is_union or origin is types.UnionType
 
     return is_union and type(None) in get_args(hint)
 
